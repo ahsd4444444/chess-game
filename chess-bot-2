@@ -1,0 +1,293 @@
+import http.server
+import socketserver
+import json
+import threading
+
+PORT = 8000
+
+# --- Chess Engine Logic ---
+
+def initial_board():
+    # Simple 8x8 array, each cell: "wp" (white pawn), "bK" (black king), etc., or "" for empty
+    board = [
+        ["bR","bN","bB","bQ","bK","bB","bN","bR"],
+        ["bp","bp","bp","bp","bp","bp","bp","bp"],
+        ["","","","","","","",""],
+        ["","","","","","","",""],
+        ["","","","","","","",""],
+        ["","","","","","","",""],
+        ["wp","wp","wp","wp","wp","wp","wp","wp"],
+        ["wR","wN","wB","wQ","wK","wB","wN","wR"]
+    ]
+    return board
+
+def is_white(piece): return piece and piece[0] == "w"
+def is_black(piece): return piece and piece[0] == "b"
+
+def all_moves(board, turn):
+    # Returns all legal moves for the current player as (from_row, from_col, to_row, to_col)
+    # Only implements pawn, rook, bishop, knight, queen, king basic moves (no castling, en passant, pawn promotion)
+    moves = []
+    for r in range(8):
+        for c in range(8):
+            piece = board[r][c]
+            if not piece: continue
+            if (turn == "w" and not is_white(piece)) or (turn == "b" and not is_black(piece)): continue
+            ptype = piece[1]
+            if ptype == "p":  # Pawn
+                direction = -1 if turn == "w" else 1
+                nr = r + direction
+                if 0 <= nr < 8:
+                    if not board[nr][c]:
+                        moves.append((r,c,nr,c))
+                    for dc in [-1,1]:
+                        nc = c + dc
+                        if 0 <= nc < 8 and board[nr][nc] and ((turn == "w" and is_black(board[nr][nc])) or (turn == "b" and is_white(board[nr][nc]))):
+                            moves.append((r,c,nr,nc))
+            elif ptype == "N":  # Knight
+                for dr, dc in [(-2,-1),(-2,1),(-1,-2),(-1,2),(1,-2),(1,2),(2,-1),(2,1)]:
+                    nr, nc = r+dr, c+dc
+                    if 0<=nr<8 and 0<=nc<8 and (not board[nr][nc] or (turn=="w" and is_black(board[nr][nc])) or (turn=="b" and is_white(board[nr][nc]))):
+                        moves.append((r,c,nr,nc))
+            elif ptype in "BRQ":  # Bishop/Rook/Queen
+                directions = []
+                if ptype in "BQ": directions += [(-1,-1),(1,1),(-1,1),(1,-1)]
+                if ptype in "RQ": directions += [(-1,0),(1,0),(0,-1),(0,1)]
+                for dr, dc in directions:
+                    nr, nc = r+dr, c+dc
+                    while 0<=nr<8 and 0<=nc<8:
+                        if not board[nr][nc]:
+                            moves.append((r,c,nr,nc))
+                        elif (turn=="w" and is_black(board[nr][nc])) or (turn=="b" and is_white(board[nr][nc])):
+                            moves.append((r,c,nr,nc))
+                            break
+                        else:
+                            break
+                        nr += dr; nc += dc
+            elif ptype == "K":  # King
+                for dr in [-1,0,1]:
+                    for dc in [-1,0,1]:
+                        if dr==0 and dc==0: continue
+                        nr, nc = r+dr, c+dc
+                        if 0<=nr<8 and 0<=nc<8 and (not board[nr][nc] or (turn=="w" and is_black(board[nr][nc])) or (turn=="b" and is_white(board[nr][nc]))):
+                            moves.append((r,c,nr,nc))
+    return moves
+
+def do_move(board, move):
+    r1,c1,r2,c2 = move
+    new_board = [row[:] for row in board]
+    new_board[r2][c2] = new_board[r1][c1]
+    new_board[r1][c1] = ""
+    return new_board
+
+def score_board(board):
+    values = {'p':1, 'N':3, 'B':3, 'R':5, 'Q':9, 'K':1000}
+    score = 0
+    for r in range(8):
+        for c in range(8):
+            p = board[r][c]
+            if not p: continue
+            v = values[p[1]]
+            if p[0] == 'w': score += v
+            else: score -= v
+    return score
+
+def minimax(board, turn, depth):
+    if depth == 0:
+        return score_board(board), None
+    moves = all_moves(board, turn)
+    if not moves:
+        return score_board(board), None
+    best_score = None
+    best_move = None
+    for move in moves:
+        new_board = do_move(board, move)
+        next_turn = "b" if turn == "w" else "w"
+        s, _ = minimax(new_board, next_turn, depth-1)
+        if turn == "w": s = s
+        else: s = -s
+        if best_score is None or s > best_score:
+            best_score = s
+            best_move = move
+    return best_score, best_move
+
+# --- Web Server with GUI ---
+
+HTML_PAGE = """
+<!DOCTYPE html>
+<html>
+<head>
+<style>
+body { font-family: sans-serif; text-align: center; }
+#board { border: 2px solid #333; display: inline-block; }
+.square { width: 50px; height: 50px; display: inline-block; vertical-align: top; font-size: 32px; line-height: 50px; cursor:pointer; }
+.w { background: #eee; }
+.b { background: #a87; }
+.selected { outline: 3px solid #008; }
+#msg { margin:10px; }
+</style>
+</head>
+<body>
+<h2>Chess Game (Python Minimax, No Download Needed)</h2>
+<div id="board"></div>
+<div id="msg"></div>
+<button onclick="restart()">Restart</button>
+<button onclick="botvsbot()">Bot vs Bot</button>
+<script>
+let selected = null;
+function piece_unicode(p) {
+    let u = { "wp":"&#9817;", "wR":"&#9814;","wN":"&#9816;", "wB":"&#9815;","wQ":"&#9813;","wK":"&#9812;",
+              "bp":"&#9823;", "bR":"&#9820;","bN":"&#9822;", "bB":"&#9821;","bQ":"&#9819;","bK":"&#9818;" };
+    return u[p]||"";
+}
+let board = [], turn = "w";
+function draw() {
+    let out = "";
+    for(let r=0;r<8;r++) {
+        for(let c=0;c<8;c++) {
+            let sq = ((r+c)%2==0?"w":"b");
+            let sel = (selected && selected[0]==r && selected[1]==c) ? "selected" : "";
+            out += `<div class="square ${sq} ${sel}" onclick="click_sq(${r},${c})">${piece_unicode(board[r][c])}</div>`;
+        }
+        out += "<br>";
+    }
+    document.getElementById("board").innerHTML = out;
+    document.getElementById("msg").innerText = (turn=="w"?"White":"Black")+"'s turn";
+}
+function click_sq(r,c) {
+    if (!selected && board[r][c] && ((turn=="w" && board[r][c][0]=="w") || (turn=="b" && board[r][c][0]=="b"))) {
+        selected = [r,c];
+        draw();
+    } else if (selected) {
+        fetch("/move", {
+            method: "POST",
+            body: JSON.stringify({board: board, turn: turn, move: [selected[0],selected[1],r,c]}),
+            headers: {"Content-Type": "application/json"}
+        }).then(resp=>resp.json()).then(data=>{
+            board = data.board;
+            turn = data.turn;
+            selected = null;
+            draw();
+            if(data.computer_move) setTimeout(()=>computer_move(),800);
+        });
+    }
+}
+function computer_move() {
+    fetch("/ai", {
+        method:"POST",
+        body: JSON.stringify({board: board, turn: turn}),
+        headers:{"Content-Type":"application/json"}
+    }).then(resp=>resp.json()).then(data=>{
+        board = data.board;
+        turn = data.turn;
+        draw();
+    });
+}
+function restart() {
+    fetch("/restart").then(resp=>resp.json()).then(data=>{
+        board = data.board;
+        turn = data.turn;
+        selected = null;
+        draw();
+    });
+}
+function botvsbot() {
+    fetch("/botvsbot", {
+        method: "POST",
+        body: JSON.stringify({board: board, turn: turn, moves: 20}),
+        headers: {"Content-Type": "application/json"}
+    }).then(resp=>resp.json()).then(data=>{
+        board = data.board;
+        turn = data.turn;
+        selected = null;
+        draw();
+        document.getElementById("msg").innerText = "Bot vs Bot finished!";
+    });
+}
+window.onload = function(){
+    restart();
+};
+</script>
+</body>
+</html>
+"""
+
+class Handler(http.server.SimpleHTTPRequestHandler):
+    state = {'board': initial_board(), 'turn': 'w'}
+    def do_GET(self):
+        if self.path == '/':
+            self.send_response(200)
+            self.send_header('Content-type','text/html')
+            self.end_headers()
+            self.wfile.write(HTML_PAGE.encode())
+        elif self.path == '/restart':
+            Handler.state = {'board': initial_board(), 'turn': 'w'}
+            self.send_response(200)
+            self.send_header('Content-type','application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps(Handler.state).encode())
+        else:
+            super().do_GET()
+    def do_POST(self):
+        length = int(self.headers.get('content-length',0))
+        data = self.rfile.read(length)
+        if self.path == '/move':
+            req = json.loads(data)
+            move = req['move']
+            moves = all_moves(req['board'], req['turn'])
+            if tuple(move) in moves:
+                board = do_move(req['board'], move)
+                next_turn = 'b' if req['turn']=='w' else 'w'
+                Handler.state = {'board': board, 'turn': next_turn}
+                computer_move = (next_turn=='b')
+                resp = {'board': board, 'turn': next_turn, 'computer_move': computer_move}
+            else:
+                resp = {'board': req['board'], 'turn': req['turn'], 'computer_move': False}
+            self.send_response(200)
+            self.send_header('Content-type','application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps(resp).encode())
+        elif self.path == '/ai':
+            req = json.loads(data)
+            s, move = minimax(req['board'], req['turn'], 2)
+            if move:
+                board = do_move(req['board'], move)
+                next_turn = 'b' if req['turn']=='w' else 'w'
+            else:
+                board = req['board']
+                next_turn = req['turn']
+            Handler.state = {'board': board, 'turn': next_turn}
+            resp = {'board': board, 'turn': next_turn}
+            self.send_response(200)
+            self.send_header('Content-type','application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps(resp).encode())
+        elif self.path == '/botvsbot':
+            req = json.loads(data)
+            board = req.get('board', initial_board())
+            turn = req.get('turn', 'w')
+            moves_left = req.get('moves', 20)
+            for _ in range(moves_left):
+                legal_moves = all_moves(board, turn)
+                if not legal_moves:
+                    break
+                _, move = minimax(board, turn, 2)
+                if move is None:
+                    break
+                board = do_move(board, move)
+                turn = 'b' if turn == 'w' else 'w'
+            Handler.state = {'board': board, 'turn': turn}
+            resp = {'board': board, 'turn': turn}
+            self.send_response(200)
+            self.send_header('Content-type','application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps(resp).encode())
+
+def run_server():
+    with socketserver.TCPServer(("", PORT), Handler) as httpd:
+        print(f"Chess game running at http://localhost:{PORT}")
+        httpd.serve_forever()
+
+if __name__ == "__main__":
+    threading.Thread(target=run_server, daemon=True).start()
+    input("Press Enter to exit...\n")
